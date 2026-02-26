@@ -10,9 +10,9 @@ LDFLAGS=-L../tommyds
 LDLIBS=-lreadline $(TREE_SITTER_DIR)/libtree-sitter.a -ltommy
 # The use of -Wall, -Werror, and -Wmissing-prototypes is mandatory 
 # for this assignment
-BASE_CFLAGS=-Wall -Werror -gdwarf-4 -O0 -fsanitize=undefined -I${TREE_SITTER_DIR}/lib/include -I${TREE_SITTER_BASH_DIR}/src -DPLAIN -I..
+BASE_CFLAGS=-Wall -Werror -gdwarf-4 -O0  -I${TREE_SITTER_DIR}/lib/include -I${TREE_SITTER_BASH_DIR}/src -DPLAIN -I..
 CFLAGS=-Wmissing-prototypes $(BASE_CFLAGS)
-#CFLAGS=-Wall -Werror -g -O2 -fsanitize=undefined -I${TREE_SITTER_DIR}/lib/include
+#CFLAGS=-Wall -Werror -g -O2  -I${TREE_SITTER_DIR}/lib/include
 
 TREE_SITTER_OBJECTS=parser.o scanner.o
 OBJECTS=signal_support.o list.o utils.o

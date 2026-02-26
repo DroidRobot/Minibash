@@ -1,1 +1,1 @@
-../tree-sitter-bash/src/scanner.c
+#include "../tree-sitter-bash/src/scanner.c"
