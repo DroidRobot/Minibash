@@ -37,6 +37,7 @@ extern char **environ;
 */
 static TSFieldId bodyId, redirectId, destinationId, valueId, nameId, conditionId;
 static TSFieldId variableId;
+static TSFieldId string_contentId;//need this for quotes
 static TSFieldId leftId, operatorId, rightId, descriptorId;
 
 static char *input;         // to avoid passing the current input around
@@ -91,6 +92,7 @@ struct job {
     int  num_processes_alive;   /* The number of processes that we know to be alive */
     pid_t pid; /* need to map job to its child process*/
     pid_t pgid; /* need to map job to its child process*/
+    int exit_status;//store exit code
 
 
     /* Add additional fields here as needed. */
@@ -237,6 +239,17 @@ wait_for_job(struct job *job)
         else
             utils_fatal_error("waitpid failed, see code for explanation");
     }
+    /*
+    * from the handout:
+    * the shell's variable table (shell_vars) is 
+    * already initialized in main() as a hashtable 
+    * for string -> string
+    * for this just use hash_put and assign the 
+    * ? variable to the exit_str
+    */
+    char exit_str[16];
+    snprintf(exit_str,sizeof(exit_str), "%d", job->exit_status);
+    hash_put(&shell_vars, "?", exit_str);
 }
 
 
@@ -302,6 +315,8 @@ handle_child_status(pid_t pid, int status)
         if(WIFEXITED(status)){
             thisJob->num_processes_alive--;
             thisJob->status = TERMINATED_VIA_EXIT;
+            //this is what captures the exit coe
+            thisJob->exit_status = WEXITSTATUS(status);
         }
 
         //process exited by a signal and is dead
@@ -309,6 +324,10 @@ handle_child_status(pid_t pid, int status)
         else if(WIFSIGNALED(status)){
             thisJob->num_processes_alive--;
             thisJob->status = TERMINATED_VIA_SIGNAL;
+            //this is from from the handout directly
+            //handles the SIGNAL sent and adds 128 for some reaosn
+            //segfault: SIGSEGV: 11 + 128 = 139 , etc
+            thisJob->exit_status = 128 + WTERMSIG(status);
         }
 
         //process is paused but still alive
@@ -344,21 +363,140 @@ allocate_handler(enum job_status jobStatus){
     //allocate_job
     struct job *thisJob = allocate_job(true);
     thisJob->status = jobStatus;
-    thisJob->num_processes_alive = 1;
+    thisJob->num_processes_alive = 1;//this might be 0?
     return thisJob;
 }
 
+
+static void strip_quotes_helper(TSNode arg_node,char **argv, int i){
+    char *raw = ts_extract_node_text(input, arg_node);
+    int len = strlen(raw);
+    bool containsDouble = (raw[0] == '"' && raw[len-1] == '"');//starts and ends with double quotes
+    bool containsSingle = (raw[0] == '\'' && raw[len-1] == '\'');//stars and ends with single quotes
+    if(len >=2 && (containsSingle || containsDouble)){
+        argv[i] = strndup(raw+1,len-2);
+        free(raw);
+    }
+    else{
+        argv[i] = raw;
+    }
+}
+
+static const char* shell_variable_helper(char *var_name){
+    const char *value = hash_get(&shell_vars, var_name);
+    if(value == NULL){//if it wasnt in shell variables...
+        value=getenv(var_name);
+    }
+    //get value from hashtable
+    if(value != NULL){
+        value =  strdup(value);
+        return value;
+    }
+    return strdup("");
+}
+
 static char** build_argv(TSNode child){
-    uint32_t numChild = ts_node_named_child_count(child);
+    int numChild = ts_node_named_child_count(child);
     char **argv = malloc(sizeof(char*) * (numChild+1));//+1 to NULL terminate
+                                                       
     //build argv
     for(int i = 0;i<numChild;i++){
         TSNode arg_node = ts_node_named_child(child,i);
-        argv[i] = ts_extract_node_text(input, arg_node);
+        const char *type = ts_node_type(arg_node);
+
+        //this handles echo $? by expanding the variables $ and ?
+        if(strcmp(type, "simple_expansion") == 0 || strcmp(type, "expansion") == 0){
+            TSNode expansionChild = ts_node_named_child(arg_node, 0);
+            char *keyInHT = ts_extract_node_text(input, expansionChild);
+            /*
+             * variables can be in the system environment or the
+             * shell environemtn
+             * we gotta check if variables $ are in either
+             */
+
+            argv[i] = (char *)shell_variable_helper(keyInHT);
+            free(keyInHT);
+        }
+
+        //we can prolly call this this quotes handler 
+        //maybe make this a helper?
+        //bash extracts content without the quotes
+        else if(strcmp(type, "string") == 0){
+            //get whats inside the double quotes
+            char result[4096] = {0};//need an empty string to store the print result
+            bool hasContent = false;
+            int stringChildren = ts_node_child_count(arg_node);
+
+            for(int j = 0;j<stringChildren;j++){
+                TSNode child_node = ts_node_child(arg_node, j);
+                const char *type_child = ts_node_type(child_node);
+                if(strcmp(type_child, "string_content") == 0){
+                    char *content = ts_extract_node_text(input, child_node);
+                    snprintf(result + strlen(result), sizeof(result) - strlen(result), "%s", content);
+                    free(content);
+                    hasContent = true;
+                }
+                //because shell variables can also be in quotes
+                else if(strcmp(type_child, "simple_expansion") == 0 || strcmp(type_child, "expansion") == 0){
+                    TSNode expansionChild = ts_node_named_child(child_node, 0);
+                    char *keyInHT = ts_extract_node_text(input, expansionChild);
+                    char *expanded = (char*)shell_variable_helper(keyInHT);
+                    snprintf(result + strlen(result), sizeof(result) - strlen(result), "%s", expanded);
+                    /*
+                     * variables can be in the system environment or the
+                     * shell environemtn
+                     * we gotta check if variables $ are in either
+                     */
+
+                    free(keyInHT);
+                    free(expanded);
+                    hasContent = true;
+                }
+            }
+            if(!hasContent){
+                //empty strjng "" case
+                strip_quotes_helper(arg_node, argv, i);
+                //this logic is now in this helper^^
+                // char *raw = ts_extract_node_text(input, arg_node);
+                // int len = strlen(raw);
+                // if(len >=2 && raw[0] == '"' && raw[len-1] == '"'){
+                //     argv[i] = strndup(raw+1,len-2);
+                //     free(raw);
+                // }
+                // else{
+                //     argv[i] = raw;
+                // }
+            }else{
+                argv[i] = strdup(result);
+            }
+        }
+
+        // for some reason the tree sitter calls single quotes "raw strings"
+        else if(strcmp(type, "raw_string") == 0){
+            //strip the single quotes
+            strip_quotes_helper(arg_node, argv, i);
+            //this logic is now in this helper^^
+            // char *raw = ts_extract_node_text(input, arg_node);
+            // int len = strlen(raw);
+            // if(len >=2 && raw[0] == '\'' && raw[len-1] == '\''){
+            //     argv[i] = strndup(raw+1,len-2);
+            //     free(raw);
+            // }
+            // else{
+            //     argv[i] = raw;
+            // }
+        }
+
+        //regulr word, no quotes
+        else{
+            argv[i] = ts_extract_node_text(input, arg_node);
+        }
     }
     argv[numChild] = NULL;//null terminate for posix_spawnp
     return argv;
 }
+
+
 static void free_argv(char **argv, int numChild){
     for(int i = 0;i<numChild;i++){
         free(argv[i]);//free text returned by ts_extract_node_text
@@ -389,9 +527,12 @@ run_program(TSNode program)
     for (uint32_t i = 0; i < count; i++) {
         TSNode child = ts_node_named_child(program, i);
         const char *type = ts_node_type(child);
-        printf("Type: %s\n",type);
+        // printf("Type: %s\n",type);
 
-        if(strcmp(type, "command") == 0){// {{{
+        if(strcmp(type, "comment") == 0){
+            continue;
+        }
+        else if(strcmp(type, "command") == 0){
             //extract the arguments
 
             // char *cmd_name = ts_extract_node_text(input, child);
@@ -405,15 +546,10 @@ run_program(TSNode program)
                 return;
             }
 
-
-            //allocate_job
-            // for(int i = 0;i<numChild;i++){
-            //     printf("argv: %s\n ", argv[i]);
-            // }
             struct job *thisJob = allocate_handler(FOREGROUND); 
 
             int pid;
-            int result = posix_spawnp(&pid, argv[0], NULL, NULL, argv, NULL);
+            int result = posix_spawnp(&pid, argv[0], NULL, NULL, argv, environ);
 
             //wait for thisJob to be done call wait_for_thisJob()
             if(result == 0){
@@ -428,9 +564,9 @@ run_program(TSNode program)
             delete_job(thisJob, true);
             free_argv(argv, numChild);
 
-        }// }}}
-        else if(strcmp(type, "pipeline") == 0){// {{{
-            // //TODO | 
+        } 
+        else if(strcmp(type, "pipeline") == 0){
+            //PIPES
             uint32_t numChild = ts_node_named_child_count(child);
 
             struct job *thisJob = allocate_handler(FOREGROUND); 
@@ -480,12 +616,11 @@ run_program(TSNode program)
                 int pid;
                 // printf("command after pipe: %s\n", argv[0]);
 
-                int result = posix_spawnp(&pid, argv[0], &actions,&attrs,argv,NULL);
+                int result = posix_spawnp(&pid, argv[0], &actions,&attrs,argv,environ);
                 //cleanup fds
                 posix_spawn_file_actions_destroy(&actions);
                 posix_spawnattr_destroy(&attrs);
                 
-
 
                 if(result == 0){//command after the pipe was successful
                     thisJob->num_processes_alive++;
@@ -510,7 +645,8 @@ run_program(TSNode program)
                 }
 
                 //free args
-                free_argv(argv, numChild);
+                int argc = ts_node_named_child_count(currNode);
+                free_argv(argv, argc);
 
             }
             wait_for_job(thisJob);
@@ -623,7 +759,7 @@ run_program(TSNode program)
             thisJob->num_processes_alive = 0;
 
             int pid;
-            int result = posix_spawnp(&pid, argv[0], &actions, NULL, argv, NULL);
+            int result = posix_spawnp(&pid, argv[0], &actions, NULL, argv, environ);
 
             if(result == 0){
                 thisJob->num_processes_alive++;
@@ -641,6 +777,24 @@ run_program(TSNode program)
             free_argv(argv,argc);
         }
         
+        else if(strcmp(type, "variable_assignment") == 0){
+            //its getting repetitive asf now....
+            //getting it from the index
+            TSNode varAssign_name = ts_node_named_child(child, 0);
+            TSNode varAssign_value= ts_node_named_child(child, 1);
+
+            //get the name and value from the TSNode
+            char *var_name = ts_extract_node_text(input, varAssign_name);
+            char *var_value = ts_extract_node_text(input, varAssign_value);
+
+            //put in in the given hastable shell_vars
+            hash_put(&shell_vars, var_name, var_value);
+
+            free(var_name);
+            free(var_value);
+            //notice no allocation of job here
+            //
+        }
         else{
             printf("node type `%s` not implemented\n", ts_node_type(child));
         }
@@ -691,6 +845,11 @@ main(int ac, char *av[])
     int opt;
     tommy_hashdyn_init(&shell_vars);
 
+    //store the actual shell's PID
+    char shellPID[16];
+    snprintf(shellPID,sizeof(shellPID),"%d", getpid());
+    hash_put(&shell_vars, "$", shellPID);
+
     /* Process command-line arguments. See getopt(3) */
     while ((opt = getopt(ac, av, "h")) > 0) {
         switch (opt) {
@@ -715,6 +874,7 @@ main(int ac, char *av[])
     DEFINE_FIELD_ID(destination);
     DEFINE_FIELD_ID(variable);
     DEFINE_FIELD_ID(descriptor);
+    DEFINE_FIELD_ID(string_content);
 
     ts_parser_set_language(parser, bash);
 
