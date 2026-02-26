@@ -17,8 +17,6 @@
 #include <sys/wait.h>
 #include <assert.h>
 #include <spawn.h>
-#include <errno.h>
-#include <stdbool.h>
 
 #include <tree_sitter/api.h>
 #include "tree_sitter/tree-sitter-bash.h"
@@ -33,23 +31,26 @@
 #include "ts_helpers.h"
 
 extern char **environ;
-
 /* These are field ids suitable for use in ts_node_child_by_field_id for certain rules. 
    e.g., to obtain the body of a while loop, you can use:
     TSNode body = ts_node_child_by_field_id(child, bodyId);
 */
 static TSFieldId bodyId, redirectId, destinationId, valueId, nameId, conditionId;
 static TSFieldId variableId;
-static TSFieldId leftId, operatorId, rightId;
+static TSFieldId string_contentId;//need this for quotes
+static TSFieldId leftId, operatorId, rightId, descriptorId;
 
 static char *input;         // to avoid passing the current input around
 static TSParser *parser;    // a singleton parser instance 
 static tommy_hashdyn shell_vars;        // a hash table containing the internal shell variables
-static int last_exit_status = 0;   // global last exit status
+                                        
+static bool shouldexit = false;
+static int exit_status = 0;
 
 static void handle_child_status(pid_t pid, int status);
 static char *read_script_from_fd(int readfd);
 static void execute_script(char *script);
+
 
 static void
 usage(char *progname)
@@ -89,8 +90,11 @@ struct job {
     int     jid;             /* Job id. */
     enum job_status status;  /* Job status. */ 
     int  num_processes_alive;   /* The number of processes that we know to be alive */
+    pid_t pid; /* need to map job to its child process*/
     pid_t pgid; /* need to map job to its child process*/
-    int exit_status;
+    int exit_status;//store exit code
+
+
     /* Add additional fields here as needed. */
 };
 
@@ -121,8 +125,6 @@ allocate_job(bool includeinjoblist)
     struct job * job = malloc(sizeof *job);
     job->num_processes_alive = 0;
     job->jid = -1;
-    job->pgid = 0;
-    job->exit_status = 0;
     if (!includeinjoblist)
         return job;
 
@@ -181,7 +183,9 @@ sigchld_handler(int sig, siginfo_t *info, void *_ctxt)
 {
     pid_t child;
     int status;
+
     assert(sig == SIGCHLD);
+
     while ((child = waitpid(-1, &status, WUNTRACED|WNOHANG)) > 0) {
         handle_child_status(child, status);
     }
@@ -235,295 +239,239 @@ wait_for_job(struct job *job)
         else
             utils_fatal_error("waitpid failed, see code for explanation");
     }
+    /*
+    * from the handout:
+    * the shell's variable table (shell_vars) is 
+    * already initialized in main() as a hashtable 
+    * for string -> string
+    * for this just use hash_put and assign the 
+    * ? variable to the exit_str
+    */
+    char exit_str[16];
+    snprintf(exit_str,sizeof(exit_str), "%d", job->exit_status);
+    hash_put(&shell_vars, "?", exit_str);
 }
 
-static struct job *
-find_job_by_pid(pid_t pid)
-{
-    struct list_elem *e;
-    for (e = list_begin(&job_list); e != list_end(&job_list); e = list_next(e)) {
-        struct job *j = list_entry(e, struct job, elem);
-        /* For a single-process job, pgid == the child's pid.
-         * For a pipeline, pgid == the first child's pid.
-         * Either way, check if this pid belongs to the group. */
-        if (j->pgid == pid)
-            return j;
-        /* Also check via getpgid in case the process is still alive */
-        pid_t pg = getpgid(pid);
-        if (pg != -1 && pg == j->pgid)
-            return j;
-    }
-    return NULL;
-}
+
 /*
- * handle_child_status — called from both the SIGCHLD handler and
- * wait_for_job whenever waitpid() reports a status change.
- *
- * Steps:
- *   1. Find which job this pid belongs to (via pgid).
- *   2. Check what happened using WIF* macros.
- *   3. Update job->exit_status and job->num_processes_alive.
- *      If all processes in the job are dead, mark it terminated.
+ * Iterate through all possible jobs and check if a job has a PID that matches
+ */
+static struct job*
+find_job_by_pid(pid_t pid){
+    //TODO: is iterating through all MAXJOBS the right approach?
+    //can we keep track of how many jobs there are from the list?
+    
+    
+    /* Alternative Approch:
+     * for(struct list_elem *curr = list_begin(&job_list);
+     *      curr != list_end(&job_list);
+     *      curr = list_next(curr)){
+     *      struct job *currJob = list_entry(curr, struct job, elem);
+     *      if(currJob->pid == pid){
+     *          return currJob;
+     *      }
+     *  }
+     */
+    //check pgid first
+    int pgid = getpgid(pid);
+    for(int i = 1;i<MAXJOBS;i++){
+        struct job *currJob = get_job_from_jid(i);
+        if(currJob != NULL){//dont dereference null pointer
+            if(currJob->pgid == pgid){
+                return currJob;
+            }
+        }
+    }
+    //lookup by normal pid
+    for(int i = 1;i<MAXJOBS;i++){
+        struct job *currJob = get_job_from_jid(i);
+        if(currJob != NULL){//dont dereference null pointer
+            if(currJob->pid == pid){
+                return currJob;
+            }
+        }
+    }
+
+    return NULL;//if not found return null
+}
+
+
+
+/*
+ * When a child changes state waitpid captures 
+ * that state as int status. 
+ * handle_child_status needs to use that int and 
+ * translate it to WIF* Macro
  */
 static void
 handle_child_status(pid_t pid, int status)
 {
     assert(signal_is_blocked(SIGCHLD));
 
-    struct job *job = find_job_by_pid(pid);
-    if (job == NULL)
-        return;
+    struct job *thisJob = find_job_by_pid(pid);
+    if(thisJob != NULL){
+        //process exited normally and is dead 
+        //set job status TERMINATED_VIA_EXIT
+        if(WIFEXITED(status)){
+            thisJob->num_processes_alive--;
+            thisJob->status = TERMINATED_VIA_EXIT;
+            //this is what captures the exit coe
+            thisJob->exit_status = WEXITSTATUS(status);
+        }
 
-    if (WIFEXITED(status)) {
-        /* Process exited normally via exit() or returning from main() */
-        job->exit_status = WEXITSTATUS(status);
-        job->num_processes_alive--;
-        if (job->num_processes_alive == 0)
-            job->status = TERMINATED_VIA_EXIT;
+        //process exited by a signal and is dead
+        //set job status TERMINATED_VIA_SIGNAL
+        else if(WIFSIGNALED(status)){
+            thisJob->num_processes_alive--;
+            thisJob->status = TERMINATED_VIA_SIGNAL;
+            //this is from from the handout directly
+            //handles the SIGNAL sent and adds 128 for some reaosn
+            //segfault: SIGSEGV: 11 + 128 = 139 , etc
+            thisJob->exit_status = 128 + WTERMSIG(status);
+        }
 
-    } else if (WIFSIGNALED(status)) {
-        /* Process was killed by a signal (e.g. SIGKILL, SIGSEGV) */
-        /* bash convention: $? = 128 + signal_number */
-        job->exit_status = 128 + WTERMSIG(status);
-        job->num_processes_alive--;
-        if (job->num_processes_alive == 0)
-            job->status = TERMINATED_VIA_SIGNAL;
+        //process is paused but still alive
+        else if(WIFSTOPPED(status)){
+            thisJob->status = STOPPED;
+        }
 
-    } else if (WIFSTOPPED(status)) {
-        /* Process was stopped (Ctrl-Z etc.) — not tested, but handle it */
-        job->status = STOPPED;
+        //"resume" stopped process
+        else if(WIFCONTINUED(status)){
+            thisJob->status = FOREGROUND;
+            //TODO: this might have to be BACKGROUND as well^^^
+        }
+
+
     }
+
+    /* To be implemented. 
+     * Step 1. Given the pid, determine which job this pid is a part of
+     *         (how to do this is not part of the provided code.)
+     * Step 2. Determine what status change occurred using the
+     *         WIF*() macros.
+     * Step 3. Update the job status accordingly, and adjust 
+     *         num_processes_alive if appropriate.
+     *         If a process was stopped, save the terminal state.
+     */
+
+
+
+}
+
+static struct job* 
+allocate_handler(enum job_status jobStatus){
+    //allocate_job
+    struct job *thisJob = allocate_job(true);
+    thisJob->status = jobStatus;
+    thisJob->num_processes_alive = 1;
+    return thisJob;
 }
 
 
-/* =========================================================================
- * Phase 1: plain words only
- *
- * expand_node takes a tree-sitter node and returns the string it
- * represents at runtime.  In Phase 1, the only node type we handle
- * is a plain "word" — we just copy the raw source text.
- *
- * Every other node type falls through to the raw-text fallback so
- * the shell at least produces some output rather than crashing.
- * ========================================================================= */
-
-static char *
-expand_node(TSNode node)
-{
-    if (ts_node_is_null(node))
-        return strdup("");
-
-    const char *type = ts_node_type(node);
-
-    /* Plain unquoted word: "echo", "hello", "/bin/ls", etc.
-     * ts_extract_node_text copies the raw source bytes for this node.
-     * The caller owns the returned string and must free() it. */
-    if (strcmp(type, "word") == 0) {
-        return ts_extract_node_text(input, node);
+static void strip_quotes_helper(TSNode arg_node,char **argv, int i){
+    char *raw = ts_extract_node_text(input, arg_node);
+    int len = strlen(raw);
+    bool containsDouble = (raw[0] == '"' && raw[len-1] == '"');//starts and ends with double quotes
+    bool containsSingle = (raw[0] == '\'' && raw[len-1] == '\'');//stars and ends with single quotes
+    if(len >=2 && (containsSingle || containsDouble)){
+        argv[i] = strndup(raw+1,len-2);
+        free(raw);
     }
-
-    /* command_name wraps the actual word in a named child */
-    if (strcmp(type, "command_name") == 0) {
-        uint32_t nc = ts_node_named_child_count(node);
-        if (nc > 0)
-            return expand_node(ts_node_named_child(node, 0));
-        return ts_extract_node_text(input, node);
+    else{
+        argv[i] = raw;
     }
-
-    /* Fallback for anything we haven't implemented yet:
-     * return the raw source text so things don't crash. */
-    return ts_extract_node_text(input, node);
 }
 
-/* =========================================================================
- * build_argv
- *
- * Walk the named children of a "command" node and build a
- * NULL-terminated argv array suitable for posix_spawnp().
- *
- * A command node looks like:
- *   command
- *     command_name   ← argv[0]
- *     word           ← argv[1]
- *     word           ← argv[2]
- *     ...
- *
- * The caller must free each string and then the array itself.
- * Use free_argv() for convenience.
- * ========================================================================= */
+static char** build_argv(TSNode child){
+    int numChild = ts_node_named_child_count(child);
+    char **argv = malloc(sizeof(char*) * (numChild+1));//+1 to NULL terminate
+                                                       
+    //build argv
+    for(int i = 0;i<numChild;i++){
+        TSNode arg_node = ts_node_named_child(child,i);
+        const char *type = ts_node_type(arg_node);
 
-static char **
-build_argv(TSNode cmd_node)
-{
-    int capacity = 8;
-    int argc = 0;
-    char **argv = malloc(capacity * sizeof(char *));
+        //this handles echo $? by expanding the variables $ and ?
+        if(strcmp(type, "simple_expansion") == 0){
+            TSNode expansionChild = ts_node_named_child(arg_node, 0);
+            char *keyInHT = ts_extract_node_text(input, expansionChild);
 
-    uint32_t nc = ts_node_named_child_count(cmd_node);
-    for (uint32_t i = 0; i < nc; i++) {
-        TSNode child = ts_node_named_child(cmd_node, i);
-        const char *ctype = ts_node_type(child);
-
-        /* Skip redirect nodes — not implemented yet in Phase 1 */
-        if (strcmp(ctype, "file_redirect") == 0)
-            continue;
-
-        /* command_name becomes argv[0] */
-        if (strcmp(ctype, "command_name") == 0) {
-            if (argc >= capacity - 1) {
-                capacity *= 2;
-                argv = realloc(argv, capacity * sizeof(char *));
+            //get value from hashtable
+            const char *value = hash_get(&shell_vars, keyInHT);
+            if(value != NULL){
+                argv[i] = strdup(value);
             }
-            argv[argc++] = expand_node(child);
-            continue;
+            else{
+                argv[i] = strdup("");
+            }
+            free(keyInHT);
         }
 
-        /* All other named children are arguments */
-        if (argc >= capacity - 1) {
-            capacity *= 2;
-            argv = realloc(argv, capacity * sizeof(char *));
+        //we can prolly call this this quotes handler 
+        //maybe make this a helper?
+        //bash extracts content without the quotes
+        else if(strcmp(type, "string") == 0){
+            //get whats inside the double quotes
+            bool hasContent = false;
+            int stringChildren = ts_node_child_count(arg_node);
+
+            for(int j = 0;j<stringChildren;j++){
+                TSNode child_node = ts_node_child(arg_node, j);
+                const char *type_child = ts_node_type(child_node);
+                if(strcmp(type_child, "string_content") == 0){
+                    argv[i] = ts_extract_node_text(input, child_node);
+                    hasContent = true;
+                    break;
+                }
+            }
+            if(!hasContent){
+                //empty strjng "" case
+                strip_quotes_helper(arg_node, argv, i);
+                //this logic is now in this helper^^
+                // char *raw = ts_extract_node_text(input, arg_node);
+                // int len = strlen(raw);
+                // if(len >=2 && raw[0] == '"' && raw[len-1] == '"'){
+                //     argv[i] = strndup(raw+1,len-2);
+                //     free(raw);
+                // }
+                // else{
+                //     argv[i] = raw;
+                // }
+            }
         }
-        argv[argc++] = expand_node(child);
+
+        // for some reason the tree sitter calls single quotes "raw strings"
+        else if(strcmp(type, "raw_string") == 0){
+            //strip the single quotes
+            strip_quotes_helper(arg_node, argv, i);
+            //this logic is now in this helper^^
+            // char *raw = ts_extract_node_text(input, arg_node);
+            // int len = strlen(raw);
+            // if(len >=2 && raw[0] == '\'' && raw[len-1] == '\''){
+            //     argv[i] = strndup(raw+1,len-2);
+            //     free(raw);
+            // }
+            // else{
+            //     argv[i] = raw;
+            // }
+        }
+
+        //regulr word, no quotes
+        else{
+            argv[i] = ts_extract_node_text(input, arg_node);
+        }
     }
-
-    argv[argc] = NULL;
+    argv[numChild] = NULL;//null terminate for posix_spawnp
     return argv;
 }
 
-static void
-free_argv(char **argv)
-{
-    if (!argv) return;
-    for (int i = 0; argv[i] != NULL; i++)
-        free(argv[i]);
-    free(argv);
+
+static void free_argv(char **argv, int numChild){
+    for(int i = 0;i<numChild;i++){
+        free(argv[i]);//free text returned by ts_extract_node_text
+    }
+    free(argv);//free from malloc^^^^
 }
-
-
-/* =========================================================================
- * Builtins
- *
- * Returns true if the command was a builtin and we handled it.
- * Sets last_exit_status as appropriate.
- * ========================================================================= */
-
-static bool
-try_builtin(char **argv)
-{
-    if (argv[0] == NULL)
-        return false;
-
-    /* exit [code] — terminate the shell */
-    if (strcmp(argv[0], "exit") == 0) {
-        int code = argv[1] ? atoi(argv[1]) : 0;
-        ts_parser_delete(parser);
-        tommy_hashdyn_foreach(&shell_vars, hash_free);
-        tommy_hashdyn_done(&shell_vars);
-        exit(code);
-    }
-    if (strcmp(argv[0], "cd") == 0) {
-        const char *dir = argv[1] ? argv[1] : (getenv("HOME") ? getenv("HOME") : "/");
-        if (chdir(dir) != 0) { 
-            utils_error("cd: %s: ", dir); 
-            last_exit_status = 1; 
-        }
-        else {
-            last_exit_status = 0;
-        }
-        return true;
-    }
-
-    return false;
-}
-
-
-
-/* =========================================================================
- * run_simple_command
- *
- * Execute a single external command using posix_spawnp().
- *
- * Key ideas:
- *   - posix_spawnp searches PATH for the program, just like execvp().
- *   - POSIX_SPAWN_SETPGROUP gives the child its own process group.
- *     We pass pgid=0 which means "use the child's own PID as group ID."
- *     This is required even for single-process jobs per the spec.
- *   - We then wait for it synchronously (foreground).
- * ========================================================================= */
-
-static int
-run_simple_command(TSNode node)
-{
-    char **argv = build_argv(node);
-
-    if (argv[0] == NULL) {
-        free_argv(argv);
-        return 0;
-    }
-
-    /* Check builtins before trying to spawn */
-    if (try_builtin(argv)) {
-        free_argv(argv);
-        return last_exit_status;
-    }
-
-    /* Set up posix_spawn attributes */
-    posix_spawn_file_actions_t fa;
-    posix_spawnattr_t attr;
-
-    if (posix_spawn_file_actions_init(&fa) != 0)
-        utils_fatal_error("posix_spawn_file_actions_init");
-    if (posix_spawnattr_init(&attr) != 0)
-        utils_fatal_error("posix_spawnattr_init");
-
-    /* Give the child its own process group (pgid=0 → use child's own PID) */
-    if (posix_spawnattr_setpgroup(&attr, 0) != 0)
-        utils_fatal_error("posix_spawnattr_setpgroup");
-
-    /* POSIX_SPAWN_SETPGROUP: actually apply the pgroup setting above.
-     * POSIX_SPAWN_USEVFORK: use vfork() internally for speed (Linux extension). */
-    int flags = POSIX_SPAWN_SETPGROUP;
-#ifdef POSIX_SPAWN_USEVFORK
-    flags |= POSIX_SPAWN_USEVFORK;
-#endif
-    if (posix_spawnattr_setflags(&attr, flags) != 0)
-        utils_fatal_error("posix_spawnattr_setflags");
-
-    pid_t child;
-    int rc = posix_spawnp(&child, argv[0], &fa, &attr, argv, environ);
-
-    if (posix_spawn_file_actions_destroy(&fa) != 0)
-        utils_error("posix_spawn_file_actions_destroy");
-    if (posix_spawnattr_destroy(&attr) != 0)
-        utils_error("posix_spawnattr_destroy");
-
-    if (rc != 0) {
-        /* posix_spawnp failed — program not found or exec error */
-        fprintf(stderr, "minibash: %s: %s\n", argv[0], strerror(rc));
-        free_argv(argv);
-        last_exit_status = 127;
-        return 127;
-    }
-
-    free_argv(argv);
-
-    /* Register this child as a foreground job so handle_child_status
-     * can find it when waitpid() reports its exit. */
-    struct job *job = allocate_job(true);
-    job->status = FOREGROUND;
-    job->pgid = child;          /* single-process job: pgid == child pid */
-    job->num_processes_alive = 1;
-
-    /* Block SIGCHLD while we wait so the signal handler and wait_for_job
-     * don't both try to reap the same child. */
-    wait_for_job(job);
-    last_exit_status = job->exit_status;
-    delete_job(job, true);
-
-    return last_exit_status;
-}
-
-
 /*
  * Run a program.
  *
@@ -550,67 +498,257 @@ run_program(TSNode program)
         const char *type = ts_node_type(child);
         // printf("Type: %s\n",type);
 
-        if (strcmp(type, "comment") == 0) {
-            /* Ignore comments */
+        if(strcmp(type, "comment") == 0){
             continue;
         }
+        else if(strcmp(type, "command") == 0){
+            //extract the arguments
 
-        if (strcmp(type, "command") == 0) {
-            run_simple_command(child);
-            continue;
+            // char *cmd_name = ts_extract_node_text(input, child);
+            // check if its exit
+            uint32_t numChild = ts_node_named_child_count(child);
+            char **argv = build_argv(child);
+            if(strcmp(argv[0], "exit") == 0){
+                shouldexit = true;
+                exit_status = 0;
+                free_argv(argv,numChild);
+                return;
+            }
+
+            struct job *thisJob = allocate_handler(FOREGROUND); 
+
+            int pid;
+            int result = posix_spawnp(&pid, argv[0], NULL, NULL, argv, environ);
+
+            //wait for thisJob to be done call wait_for_thisJob()
+            if(result == 0){
+                thisJob->pid = pid;
+                wait_for_job(thisJob);
+            }else{
+                perror("posix_spawnp didnt work");
+                thisJob->num_processes_alive--;
+            }
+
+            //cleanup memory
+            delete_job(thisJob, true);
+            free_argv(argv, numChild);
+
+        } 
+        else if(strcmp(type, "pipeline") == 0){
+            //PIPES
+            uint32_t numChild = ts_node_named_child_count(child);
+
+            struct job *thisJob = allocate_handler(FOREGROUND); 
+            thisJob -> num_processes_alive = 0;
+            thisJob->pgid = 0;
+
+            int stdin_fd = STDIN_FILENO;//first command (ls) must read from stdin
+
+
+            //ls | cat 
+            //stdout of ls goes into stdin vim 
+            for(int i = 0;i<numChild;i++){
+                TSNode currNode = ts_node_named_child(child,i);
+
+                //build argv for each command between | pipes
+                char **argv = build_argv(currNode);
+                int pipe[2];
+                if(i != numChild - 1){
+                    int lastPipe = pipe2(pipe, O_CLOEXEC);
+                    if(lastPipe == -1){
+                        perror("pipe2 failed");
+                        return;
+                    }
+                }
+
+                //file actions for handling pipes stdin and stdout
+                posix_spawn_file_actions_t actions;
+                posix_spawn_file_actions_init(&actions) ;
+
+                if(stdin_fd != STDIN_FILENO){
+                    posix_spawn_file_actions_adddup2(&actions, stdin_fd, STDIN_FILENO);
+                }
+                if (i != numChild-1){
+                    posix_spawn_file_actions_adddup2(&actions, pipe[1], STDOUT_FILENO);
+                }
+
+                posix_spawnattr_t attrs;
+                posix_spawnattr_init(&attrs);
+
+                short flags = POSIX_SPAWN_SETPGROUP;
+                posix_spawnattr_setflags(&attrs, flags);
+
+                //first process should set the process group id to its own pid
+                posix_spawnattr_setpgroup(&attrs, thisJob->pgid);
+
+                //creat children
+                int pid;
+                // printf("command after pipe: %s\n", argv[0]);
+
+                int result = posix_spawnp(&pid, argv[0], &actions,&attrs,argv,environ);
+                //cleanup fds
+                posix_spawn_file_actions_destroy(&actions);
+                posix_spawnattr_destroy(&attrs);
+                
+
+                if(result == 0){//command after the pipe was successful
+                    thisJob->num_processes_alive++;
+                    thisJob->pid = pid;//needed?
+                    //first process should set the process group id to its own pid
+                    if(i==0){
+                        thisJob->pgid = pid;
+                    }
+                }
+                else{
+                    printf("posix didnt work in pipe");
+                }
+
+                // printf("i: %d\n", i);
+                // printf("numchild: %d\n",numChild);
+                if(stdin_fd != STDIN_FILENO){
+                    close(stdin_fd);
+                }
+                if (i != numChild -1){
+                    close(pipe[1]);//close stdout of current pipe
+                    stdin_fd = pipe[0];
+                }
+
+                //free args
+                int argc = ts_node_named_child_count(currNode);
+                free_argv(argv, argc);
+
+            }
+            wait_for_job(thisJob);
+            delete_job(thisJob, true);
+
+        }// 
+        else if(strcmp(type, "redirected_statement") == 0){
+            //get the body of the node
+            TSNode bodyNode = ts_node_child_by_field_id(child, bodyId);
+            char **argv = build_argv(bodyNode);
+            int argc = ts_node_named_child_count(bodyNode);
+
+            //start actions like from piping
+            posix_spawn_file_actions_t actions;
+            posix_spawn_file_actions_init(&actions);
+
+            //count how many redirects
+            int redirects = ts_node_named_child_count(child);
+            int fds[16];
+            int num_fds_open = 0;
+            for(int i = 0;i<redirects;i++){
+                //child in "ls > out.txt" is: "> out.txt"
+                TSNode redirect_child = ts_node_named_child(child, i);
+                const char *typeShi = ts_node_type(redirect_child);//why typeShi? bc type was taken
+
+                //need this loop for multiple file redirects in a single command: ls > yo.txt > wc
+                if(strcmp(typeShi, "file_redirect") == 0){
+                    TSNode destination = ts_node_child_by_field_id(redirect_child, destinationId);
+                    char *filename = ts_extract_node_text(input, destination);
+                    char *redir_text = ts_extract_node_text(input, redirect_child);
+
+                    //check if the redicret has a file descriptor
+                    TSNode descriptor_node = ts_node_child_by_field_id(redirect_child,descriptorId);
+                    bool has_descriptor = !ts_node_is_null(descriptor_node);
+
+                    //hold the flags in a variable and then just go through
+                    //the bottom if else block to fill it in based on
+                    //why? bc it would look unreadable if u didnt 
+                    // int fd;
+                    int flags = 0;
+                    int target_fd;
+                    bool skip_open = false; //MUST have this for the fd to fd redirects >&N
+
+                    //check if there is a file descriptor
+                    int source_fd = STDOUT_FILENO;
+                    if(has_descriptor){
+                        char *desc_str = ts_extract_node_text(input, descriptor_node);
+                        source_fd = atoi(desc_str);//convert int to string
+                        free(desc_str);
+                    }
+
+                    //check the flags and set the target_fd
+                    if(strncmp(redir_text,"&>",2) == 0){
+                        //THIS REDIRECTS BOTH STDOUT AND STDERR
+                        flags = O_WRONLY | O_CREAT | O_CLOEXEC | O_TRUNC;
+                        target_fd = STDOUT_FILENO;
+                    }
+                    else if(strncmp(redir_text,">&",2) == 0  || strncmp(redir_text,"2>&",3) == 0){
+                        // >&N or 2>&N means fd to fd
+                        target_fd = source_fd;
+                        skip_open = true;
+                    }
+                    else if(strncmp(redir_text, ">", 1) == 0){
+                        flags = O_WRONLY | O_CREAT | O_CLOEXEC | O_TRUNC;
+                        target_fd = STDOUT_FILENO;
+                    }
+                    else if(strncmp(redir_text, "<", 1) == 0){
+                        flags = O_RDONLY | O_CLOEXEC;
+                        target_fd = STDIN_FILENO;
+                    }
+
+                    //do we have to open files?not if its fd to fd (>& or 2>&)
+                    if(skip_open){
+                        int dest_fd = atoi(filename);
+                        posix_spawn_file_actions_adddup2(&actions,dest_fd,target_fd);
+                    }
+                    else if(strncmp(redir_text, "&>", 2) == 0){
+                        //this is the case for &>, open file and then must dup2 
+                        //TWICE for both STDOUT AND STDERR!!!
+                        int fd = open(filename, flags, 0666);
+                        if (fd == -1){
+                            printf("open failed");
+                        }
+                        else{
+                            posix_spawn_file_actions_adddup2(&actions, fd, STDOUT_FILENO);
+                            posix_spawn_file_actions_adddup2(&actions, fd, STDERR_FILENO);
+                            fds[num_fds_open++] = fd;
+                        }
+
+                    }
+                    else if( target_fd != -1){
+                        int fd = open(filename, flags, 0666);
+                        if (fd == -1){
+                            printf("open failed");
+                        }
+                        else{
+                            posix_spawn_file_actions_adddup2(&actions, fd, target_fd);
+                            fds[num_fds_open++] = fd;
+                        }
+                    }
+
+                    //cleanup
+                    free(filename);
+                    free(redir_text);
+                }
+            }
+
+            //create the job
+            struct job *thisJob = allocate_handler(FOREGROUND);
+            thisJob->num_processes_alive = 0;
+
+            int pid;
+            int result = posix_spawnp(&pid, argv[0], &actions, NULL, argv, environ);
+
+            if(result == 0){
+                thisJob->num_processes_alive++;
+                thisJob->pid = pid;
+                wait_for_job(thisJob);
+            }
+            else{
+                printf("somethin failed");
+            }
+            for(int i = 0;i<num_fds_open;i++){
+                close(fds[i]);
+            }
+
+            delete_job(thisJob,true);
+            free_argv(argv,argc);
         }
-
-        /* Everything else is not yet implemented */
-        fprintf(stderr, "minibash: node type '%s' not yet implemented\n", type);
-
-        // if(strcmp(type, "command") == 0){
-        //     //extract the arguments
-        //     // char *cmd_name = ts_extract_node_text(input, child);
-        //     uint32_t numChild = ts_node_named_child_count(child);
-        //     char **args = malloc(sizeof(char*) * (numChild+1));//+1 to NULL terminate
-        //     //build argv
-        //     for(int i = 0;i<numChild;i++){
-        //         TSNode arg_node = ts_node_named_child(child,i);
-        //         args[i] = ts_extract_node_text(input, arg_node);
-        //     }
-        //     args[numChild] = NULL;//null terminate for posix_spawnp
-
-        //     // args[0] = cmd_name;
-
-        //     //handle quotes here?
-
-        //     //allocate_job
-        //     struct job *thisJob = allocate_job(true);
-        //     (*thisJob).status = FOREGROUND;
-        //     (*thisJob).num_processes_alive = 1;
-
-        //     int pid;
-        //     int result = posix_spawnp(&pid, args[0], NULL, NULL, args, NULL);
-            
-
-
-
-        //     //wait for thisJob to be done call wait_for_thisJob()
-
-
-        //     if(result == 0){
-        //         thisJob->pid = pid;
-        //         wait_for_job(thisJob);
-        //     }else{
-        //         perror("posix_spawnp didnt work");
-        //         thisJob->num_processes_alive--;
-        //     }
-
-        //     //cleanup memory
-        //     delete_job(thisJob, true);
-        //     for(int i = 0;i<numChild;i++){
-        //         free(args[i]);//free text returned by ts_extract_node_text
-        //     }
-        //     free(args);//free from malloc^^^^
-
-        // }else{
-        //     printf("node type `%s` not implemented\n", ts_node_type(child));
-        // }
+        
+        else{
+            printf("node type `%s` not implemented\n", ts_node_type(child));
+        }
     }
 }
 
@@ -658,6 +796,11 @@ main(int ac, char *av[])
     int opt;
     tommy_hashdyn_init(&shell_vars);
 
+    //store the actual shell's PID
+    char shellPID[16];
+    snprintf(shellPID,sizeof(shellPID),"%d", getpid());
+    hash_put(&shell_vars, "$", shellPID);
+
     /* Process command-line arguments. See getopt(3) */
     while ((opt = getopt(ac, av, "h")) > 0) {
         switch (opt) {
@@ -681,6 +824,9 @@ main(int ac, char *av[])
     DEFINE_FIELD_ID(redirect);
     DEFINE_FIELD_ID(destination);
     DEFINE_FIELD_ID(variable);
+    DEFINE_FIELD_ID(descriptor);
+    DEFINE_FIELD_ID(string_content);
+
     ts_parser_set_language(parser, bash);
 
     list_init(&job_list);
@@ -688,7 +834,6 @@ main(int ac, char *av[])
 
 
     /* Read/eval loop. */
-    bool shouldexit = false;
     for (;;) {
         if (shouldexit)
             break;
@@ -732,5 +877,5 @@ main(int ac, char *av[])
     ts_parser_delete(parser);
     tommy_hashdyn_foreach(&shell_vars, hash_free);
     tommy_hashdyn_done(&shell_vars);
-    return EXIT_SUCCESS;
+    return exit_status;
 }
