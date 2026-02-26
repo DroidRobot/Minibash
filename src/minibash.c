@@ -395,6 +395,40 @@ static const char* shell_variable_helper(char *var_name){
     return strdup("");
 }
 
+static char* command_sub_helper(char **argv){
+    //this uses popen(), which takes care of creating pipes
+    //forks and running the command
+    //it returns a pointer to a file FILE*
+    
+    char cmd[4096] = {0};//the command itself
+    for(int i = 0;argv[i]!=NULL;i++){
+        if(i>0){//must add space between the args
+            snprintf(cmd + strlen(cmd), sizeof(cmd) - strlen(cmd), "%s", " ");
+        }
+        snprintf(cmd + strlen(cmd), sizeof(cmd) - strlen(cmd), "%s", argv[i]);
+    }
+
+    //open pipes and run
+    FILE *fp = popen(cmd, "r");
+    if(fp == NULL){
+        return strdup("");
+    }
+
+    //read output
+    char buffer [4096] = {0};
+    fread(buffer, 1, sizeof(buffer), fp);
+
+    //remove the new line
+    //this is like ex0
+    int len = strlen(buffer);
+    if(len > 0 && buffer[len-1] == '\n'){
+        buffer[len-1] = '\0';
+    }
+
+    pclose(fp);
+    return strdup(buffer);
+}
+
 static char** build_argv(TSNode child){
     int numChild = ts_node_named_child_count(child);
     char **argv = malloc(sizeof(char*) * (numChild+1));//+1 to NULL terminate
@@ -470,7 +504,6 @@ static char** build_argv(TSNode child){
                 argv[i] = strdup(result);
             }
         }
-
         // for some reason the tree sitter calls single quotes "raw strings"
         else if(strcmp(type, "raw_string") == 0){
             //strip the single quotes
@@ -487,6 +520,18 @@ static char** build_argv(TSNode child){
             // }
         }
 
+        else if(strcmp(type, "command_substitution") == 0){
+            TSNode inner_cmd = ts_node_named_child(arg_node, 0);
+            char **inner_argv = build_argv(inner_cmd);//yes, recursion
+
+            //free the inner arg commands
+            argv[i] = command_sub_helper(inner_argv);
+            for(int j = 0;inner_argv[j] != NULL;j++){
+                free(inner_argv[j]);
+            }
+            free(inner_argv);
+
+        }
         //regulr word, no quotes
         else{
             argv[i] = ts_extract_node_text(input, arg_node);
