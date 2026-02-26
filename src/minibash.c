@@ -45,6 +45,7 @@ static TSParser *parser;    // a singleton parser instance
 static tommy_hashdyn shell_vars;        // a hash table containing the internal shell variables
                                         
 static bool shouldexit = false;
+static bool break_flag = false;//this is for the break statement in loops
 static int exit_status = 0;
 
 static void handle_child_status(pid_t pid, int status);
@@ -548,6 +549,9 @@ static void free_argv(char **argv, int numChild){
     }
     free(argv);//free from malloc^^^^
 }
+
+static void run_statement(TSNode statement);
+
 /*
  * Run a program.
  *
@@ -570,279 +574,639 @@ run_program(TSNode program)
      */
     uint32_t count = ts_node_named_child_count(program);
     for (uint32_t i = 0; i < count; i++) {
-        TSNode child = ts_node_named_child(program, i);
-        const char *type = ts_node_type(child);
-        // printf("Type: %s\n",type);
+        if (break_flag) return; // handle break in loops
+        // TSNode child = ts_node_named_child(program, i);
+        run_statement(ts_node_named_child(program, i));
 
-        if(strcmp(type, "comment") == 0){
-            continue;
-        }
-        else if(strcmp(type, "command") == 0){
-            //extract the arguments
+        // const char *type = ts_node_type(child);
+        // // printf("Type: %s\n",type);
 
-            // char *cmd_name = ts_extract_node_text(input, child);
-            // check if its exit
-            uint32_t numChild = ts_node_named_child_count(child);
-            char **argv = build_argv(child);
-            if(strcmp(argv[0], "exit") == 0){
-                shouldexit = true;
-                exit_status = 0;
-                free_argv(argv,numChild);
-                return;
-            }
+        // if(strcmp(type, "comment") == 0){
+        //     continue;
+        // }
+        // else if(strcmp(type, "command") == 0){
+        //     //extract the arguments
 
-            struct job *thisJob = allocate_handler(FOREGROUND); 
+        //     // char *cmd_name = ts_extract_node_text(input, child);
+        //     // check if its exit
+        //     uint32_t numChild = ts_node_named_child_count(child);
+        //     char **argv = build_argv(child);
+        //     if(strcmp(argv[0], "exit") == 0){
+        //         shouldexit = true;
+        //         exit_status = 0;
+        //         free_argv(argv,numChild);
+        //         return;
+        //     }
 
-            int pid;
-            int result = posix_spawnp(&pid, argv[0], NULL, NULL, argv, environ);
+        //     struct job *thisJob = allocate_handler(FOREGROUND); 
 
-            //wait for thisJob to be done call wait_for_thisJob()
-            if(result == 0){
-                thisJob->pid = pid;
-                wait_for_job(thisJob);
-            }else{
-                perror("posix_spawnp didnt work");
-                thisJob->num_processes_alive--;
-            }
+        //     int pid;
+        //     int result = posix_spawnp(&pid, argv[0], NULL, NULL, argv, environ);
 
-            //cleanup memory
-            delete_job(thisJob, true);
-            free_argv(argv, numChild);
+        //     //wait for thisJob to be done call wait_for_thisJob()
+        //     if(result == 0){
+        //         thisJob->pid = pid;
+        //         wait_for_job(thisJob);
+        //     }else{
+        //         perror("posix_spawnp didnt work");
+        //         thisJob->num_processes_alive--;
+        //     }
 
-        } 
-        else if(strcmp(type, "pipeline") == 0){
-            //PIPES
-            uint32_t numChild = ts_node_named_child_count(child);
+        //     //cleanup memory
+        //     delete_job(thisJob, true);
+        //     free_argv(argv, numChild);
 
-            struct job *thisJob = allocate_handler(FOREGROUND); 
-            thisJob -> num_processes_alive = 0;
-            thisJob->pgid = 0;
+        // } 
+        // else if(strcmp(type, "pipeline") == 0){
+        //     //PIPES
+        //     uint32_t numChild = ts_node_named_child_count(child);
 
-            int stdin_fd = STDIN_FILENO;//first command (ls) must read from stdin
+        //     struct job *thisJob = allocate_handler(FOREGROUND); 
+        //     thisJob -> num_processes_alive = 0;
+        //     thisJob->pgid = 0;
+
+        //     int stdin_fd = STDIN_FILENO;//first command (ls) must read from stdin
 
 
-            //ls | cat 
-            //stdout of ls goes into stdin vim 
-            for(int i = 0;i<numChild;i++){
-                TSNode currNode = ts_node_named_child(child,i);
+        //     //ls | cat 
+        //     //stdout of ls goes into stdin vim 
+        //     for(int i = 0;i<numChild;i++){
+        //         TSNode currNode = ts_node_named_child(child,i);
 
-                //build argv for each command between | pipes
-                char **argv = build_argv(currNode);
-                int pipe[2];
-                if(i != numChild - 1){
-                    int lastPipe = pipe2(pipe, O_CLOEXEC);
-                    if(lastPipe == -1){
-                        perror("pipe2 failed");
-                        return;
-                    }
-                }
+        //         //build argv for each command between | pipes
+        //         char **argv = build_argv(currNode);
+        //         int pipe[2];
+        //         if(i != numChild - 1){
+        //             int lastPipe = pipe2(pipe, O_CLOEXEC);
+        //             if(lastPipe == -1){
+        //                 perror("pipe2 failed");
+        //                 return;
+        //             }
+        //         }
 
-                //file actions for handling pipes stdin and stdout
-                posix_spawn_file_actions_t actions;
-                posix_spawn_file_actions_init(&actions) ;
+        //         //file actions for handling pipes stdin and stdout
+        //         posix_spawn_file_actions_t actions;
+        //         posix_spawn_file_actions_init(&actions) ;
 
-                if(stdin_fd != STDIN_FILENO){
-                    posix_spawn_file_actions_adddup2(&actions, stdin_fd, STDIN_FILENO);
-                }
-                if (i != numChild-1){
-                    posix_spawn_file_actions_adddup2(&actions, pipe[1], STDOUT_FILENO);
-                }
+        //         if(stdin_fd != STDIN_FILENO){
+        //             posix_spawn_file_actions_adddup2(&actions, stdin_fd, STDIN_FILENO);
+        //         }
+        //         if (i != numChild-1){
+        //             posix_spawn_file_actions_adddup2(&actions, pipe[1], STDOUT_FILENO);
+        //         }
 
-                posix_spawnattr_t attrs;
-                posix_spawnattr_init(&attrs);
+        //         posix_spawnattr_t attrs;
+        //         posix_spawnattr_init(&attrs);
 
-                short flags = POSIX_SPAWN_SETPGROUP;
-                posix_spawnattr_setflags(&attrs, flags);
+        //         short flags = POSIX_SPAWN_SETPGROUP;
+        //         posix_spawnattr_setflags(&attrs, flags);
 
-                //first process should set the process group id to its own pid
-                posix_spawnattr_setpgroup(&attrs, thisJob->pgid);
+        //         //first process should set the process group id to its own pid
+        //         posix_spawnattr_setpgroup(&attrs, thisJob->pgid);
 
-                //creat children
-                int pid;
-                // printf("command after pipe: %s\n", argv[0]);
+        //         //creat children
+        //         int pid;
+        //         // printf("command after pipe: %s\n", argv[0]);
 
-                int result = posix_spawnp(&pid, argv[0], &actions,&attrs,argv,environ);
-                //cleanup fds
-                posix_spawn_file_actions_destroy(&actions);
-                posix_spawnattr_destroy(&attrs);
+        //         int result = posix_spawnp(&pid, argv[0], &actions,&attrs,argv,environ);
+        //         //cleanup fds
+        //         posix_spawn_file_actions_destroy(&actions);
+        //         posix_spawnattr_destroy(&attrs);
                 
 
-                if(result == 0){//command after the pipe was successful
-                    thisJob->num_processes_alive++;
-                    thisJob->pid = pid;//needed?
-                    //first process should set the process group id to its own pid
-                    if(i==0){
-                        thisJob->pgid = pid;
-                    }
-                }
-                else{
-                    printf("posix didnt work in pipe");
-                }
+        //         if(result == 0){//command after the pipe was successful
+        //             thisJob->num_processes_alive++;
+        //             thisJob->pid = pid;//needed?
+        //             //first process should set the process group id to its own pid
+        //             if(i==0){
+        //                 thisJob->pgid = pid;
+        //             }
+        //         }
+        //         else{
+        //             printf("posix didnt work in pipe");
+        //         }
 
-                // printf("i: %d\n", i);
-                // printf("numchild: %d\n",numChild);
-                if(stdin_fd != STDIN_FILENO){
-                    close(stdin_fd);
-                }
-                if (i != numChild -1){
-                    close(pipe[1]);//close stdout of current pipe
-                    stdin_fd = pipe[0];
-                }
+        //         // printf("i: %d\n", i);
+        //         // printf("numchild: %d\n",numChild);
+        //         if(stdin_fd != STDIN_FILENO){
+        //             close(stdin_fd);
+        //         }
+        //         if (i != numChild -1){
+        //             close(pipe[1]);//close stdout of current pipe
+        //             stdin_fd = pipe[0];
+        //         }
 
-                //free args
-                int argc = ts_node_named_child_count(currNode);
-                free_argv(argv, argc);
+        //         //free args
+        //         int argc = ts_node_named_child_count(currNode);
+        //         free_argv(argv, argc);
 
-            }
+        //     }
+        //     wait_for_job(thisJob);
+        //     delete_job(thisJob, true);
+
+        // }// 
+        // else if(strcmp(type, "redirected_statement") == 0){
+        //     //get the body of the node
+        //     TSNode bodyNode = ts_node_child_by_field_id(child, bodyId);
+        //     char **argv = build_argv(bodyNode);
+        //     int argc = ts_node_named_child_count(bodyNode);
+
+        //     //start actions like from piping
+        //     posix_spawn_file_actions_t actions;
+        //     posix_spawn_file_actions_init(&actions);
+
+        //     //count how many redirects
+        //     int redirects = ts_node_named_child_count(child);
+        //     int fds[16];
+        //     int num_fds_open = 0;
+        //     for(int i = 0;i<redirects;i++){
+        //         //child in "ls > out.txt" is: "> out.txt"
+        //         TSNode redirect_child = ts_node_named_child(child, i);
+        //         const char *typeShi = ts_node_type(redirect_child);//why typeShi? bc type was taken
+
+        //         //need this loop for multiple file redirects in a single command: ls > yo.txt > wc
+        //         if(strcmp(typeShi, "file_redirect") == 0){
+        //             TSNode destination = ts_node_child_by_field_id(redirect_child, destinationId);
+        //             char *filename = ts_extract_node_text(input, destination);
+        //             char *redir_text = ts_extract_node_text(input, redirect_child);
+
+        //             //check if the redicret has a file descriptor
+        //             TSNode descriptor_node = ts_node_child_by_field_id(redirect_child,descriptorId);
+        //             bool has_descriptor = !ts_node_is_null(descriptor_node);
+
+        //             //hold the flags in a variable and then just go through
+        //             //the bottom if else block to fill it in based on
+        //             //why? bc it would look unreadable if u didnt 
+        //             // int fd;
+        //             int flags = 0;
+        //             int target_fd;
+        //             bool skip_open = false; //MUST have this for the fd to fd redirects >&N
+
+        //             //check if there is a file descriptor
+        //             int source_fd = STDOUT_FILENO;
+        //             if(has_descriptor){
+        //                 char *desc_str = ts_extract_node_text(input, descriptor_node);
+        //                 source_fd = atoi(desc_str);//convert int to string
+        //                 free(desc_str);
+        //             }
+
+        //             //check the flags and set the target_fd
+        //             if(strncmp(redir_text,"&>",2) == 0){
+        //                 //THIS REDIRECTS BOTH STDOUT AND STDERR
+        //                 flags = O_WRONLY | O_CREAT | O_CLOEXEC | O_TRUNC;
+        //                 target_fd = STDOUT_FILENO;
+        //             }
+        //             else if(strncmp(redir_text,">&",2) == 0  || strncmp(redir_text,"2>&",3) == 0){
+        //                 // >&N or 2>&N means fd to fd
+        //                 target_fd = source_fd;
+        //                 skip_open = true;
+        //             }
+        //             else if(strncmp(redir_text, ">", 1) == 0){
+        //                 flags = O_WRONLY | O_CREAT | O_CLOEXEC | O_TRUNC;
+        //                 target_fd = STDOUT_FILENO;
+        //             }
+        //             else if(strncmp(redir_text, "<", 1) == 0){
+        //                 flags = O_RDONLY | O_CLOEXEC;
+        //                 target_fd = STDIN_FILENO;
+        //             }
+
+        //             //do we have to open files?not if its fd to fd (>& or 2>&)
+        //             if(skip_open){
+        //                 int dest_fd = atoi(filename);
+        //                 posix_spawn_file_actions_adddup2(&actions,dest_fd,target_fd);
+        //             }
+        //             else if(strncmp(redir_text, "&>", 2) == 0){
+        //                 //this is the case for &>, open file and then must dup2 
+        //                 //TWICE for both STDOUT AND STDERR!!!
+        //                 int fd = open(filename, flags, 0666);
+        //                 if (fd == -1){
+        //                     printf("open failed");
+        //                 }
+        //                 else{
+        //                     posix_spawn_file_actions_adddup2(&actions, fd, STDOUT_FILENO);
+        //                     posix_spawn_file_actions_adddup2(&actions, fd, STDERR_FILENO);
+        //                     fds[num_fds_open++] = fd;
+        //                 }
+
+        //             }
+        //             else if( target_fd != -1){
+        //                 int fd = open(filename, flags, 0666);
+        //                 if (fd == -1){
+        //                     printf("open failed");
+        //                 }
+        //                 else{
+        //                     posix_spawn_file_actions_adddup2(&actions, fd, target_fd);
+        //                     fds[num_fds_open++] = fd;
+        //                 }
+        //             }
+
+        //             //cleanup
+        //             free(filename);
+        //             free(redir_text);
+        //         }
+        //     }
+
+        //     //create the job
+        //     struct job *thisJob = allocate_handler(FOREGROUND);
+        //     thisJob->num_processes_alive = 0;
+
+        //     int pid;
+        //     int result = posix_spawnp(&pid, argv[0], &actions, NULL, argv, environ);
+
+        //     if(result == 0){
+        //         thisJob->num_processes_alive++;
+        //         thisJob->pid = pid;
+        //         wait_for_job(thisJob);
+        //     }
+        //     else{
+        //         printf("somethin failed");
+        //     }
+        //     for(int i = 0;i<num_fds_open;i++){
+        //         close(fds[i]);
+        //     }
+
+        //     delete_job(thisJob,true);
+        //     free_argv(argv,argc);
+        // }
+        
+        // else if(strcmp(type, "variable_assignment") == 0){
+        //     //its getting repetitive asf now....
+        //     //getting it from the index
+        //     TSNode varAssign_name = ts_node_named_child(child, 0);
+        //     TSNode varAssign_value= ts_node_named_child(child, 1);
+
+        //     //get the name and value from the TSNode
+        //     char *var_name = ts_extract_node_text(input, varAssign_name);
+        //     char *var_value = ts_extract_node_text(input, varAssign_value);
+
+        //     //put in in the given hastable shell_vars
+        //     hash_put(&shell_vars, var_name, var_value);
+
+        //     free(var_name);
+        //     free(var_value);
+        //     //notice no allocation of job here
+        //     //
+        // }
+        // else{
+        //     printf("node type `%s` not implemented\n", ts_node_type(child));
+        // }
+    }
+}
+
+
+static void run_statement(TSNode node){
+
+    const char *type = ts_node_type(node);
+    // printf("Type: %s\n",type);
+
+    if(strcmp(type, "comment") == 0){
+        return;//do nothing for comments
+    }
+    else if(strcmp(type, "command") == 0){
+        //extract the arguments
+
+        // char *cmd_name = ts_extract_node_text(input, child);
+        // check if its exit
+        uint32_t numChild = ts_node_named_child_count(node);
+        char **argv = build_argv(node);
+        if(strcmp(argv[0], "exit") == 0){
+            shouldexit = true;
+            exit_status = 0;
+            free_argv(argv,numChild);
+            return;
+        }
+
+        struct job *thisJob = allocate_handler(FOREGROUND); 
+
+        int pid;
+        int result = posix_spawnp(&pid, argv[0], NULL, NULL, argv, environ);
+
+        //wait for thisJob to be done call wait_for_thisJob()
+        if(result == 0){
+            thisJob->pid = pid;
             wait_for_job(thisJob);
-            delete_job(thisJob, true);
+        }else{
+            perror("posix_spawnp didnt work");
+            thisJob->num_processes_alive--;
+        }
 
-        }// 
-        else if(strcmp(type, "redirected_statement") == 0){
-            //get the body of the node
-            TSNode bodyNode = ts_node_child_by_field_id(child, bodyId);
-            char **argv = build_argv(bodyNode);
-            int argc = ts_node_named_child_count(bodyNode);
+        //cleanup memory
+        delete_job(thisJob, true);
+        free_argv(argv, numChild);
 
-            //start actions like from piping
-            posix_spawn_file_actions_t actions;
-            posix_spawn_file_actions_init(&actions);
+    } 
+    else if(strcmp(type, "pipeline") == 0){
+        //PIPES
+        uint32_t numChild = ts_node_named_child_count(node);
 
-            //count how many redirects
-            int redirects = ts_node_named_child_count(child);
-            int fds[16];
-            int num_fds_open = 0;
-            for(int i = 0;i<redirects;i++){
-                //child in "ls > out.txt" is: "> out.txt"
-                TSNode redirect_child = ts_node_named_child(child, i);
-                const char *typeShi = ts_node_type(redirect_child);//why typeShi? bc type was taken
+        struct job *thisJob = allocate_handler(FOREGROUND); 
+        thisJob -> num_processes_alive = 0;
+        thisJob->pgid = 0;
 
-                //need this loop for multiple file redirects in a single command: ls > yo.txt > wc
-                if(strcmp(typeShi, "file_redirect") == 0){
-                    TSNode destination = ts_node_child_by_field_id(redirect_child, destinationId);
-                    char *filename = ts_extract_node_text(input, destination);
-                    char *redir_text = ts_extract_node_text(input, redirect_child);
+        int stdin_fd = STDIN_FILENO;//first command (ls) must read from stdin
 
-                    //check if the redicret has a file descriptor
-                    TSNode descriptor_node = ts_node_child_by_field_id(redirect_child,descriptorId);
-                    bool has_descriptor = !ts_node_is_null(descriptor_node);
 
-                    //hold the flags in a variable and then just go through
-                    //the bottom if else block to fill it in based on
-                    //why? bc it would look unreadable if u didnt 
-                    // int fd;
-                    int flags = 0;
-                    int target_fd;
-                    bool skip_open = false; //MUST have this for the fd to fd redirects >&N
+        //ls | cat 
+        //stdout of ls goes into stdin vim 
+        for(int i = 0;i<numChild;i++){
+            TSNode currNode = ts_node_named_child(node,i);
 
-                    //check if there is a file descriptor
-                    int source_fd = STDOUT_FILENO;
-                    if(has_descriptor){
-                        char *desc_str = ts_extract_node_text(input, descriptor_node);
-                        source_fd = atoi(desc_str);//convert int to string
-                        free(desc_str);
-                    }
-
-                    //check the flags and set the target_fd
-                    if(strncmp(redir_text,"&>",2) == 0){
-                        //THIS REDIRECTS BOTH STDOUT AND STDERR
-                        flags = O_WRONLY | O_CREAT | O_CLOEXEC | O_TRUNC;
-                        target_fd = STDOUT_FILENO;
-                    }
-                    else if(strncmp(redir_text,">&",2) == 0  || strncmp(redir_text,"2>&",3) == 0){
-                        // >&N or 2>&N means fd to fd
-                        target_fd = source_fd;
-                        skip_open = true;
-                    }
-                    else if(strncmp(redir_text, ">", 1) == 0){
-                        flags = O_WRONLY | O_CREAT | O_CLOEXEC | O_TRUNC;
-                        target_fd = STDOUT_FILENO;
-                    }
-                    else if(strncmp(redir_text, "<", 1) == 0){
-                        flags = O_RDONLY | O_CLOEXEC;
-                        target_fd = STDIN_FILENO;
-                    }
-
-                    //do we have to open files?not if its fd to fd (>& or 2>&)
-                    if(skip_open){
-                        int dest_fd = atoi(filename);
-                        posix_spawn_file_actions_adddup2(&actions,dest_fd,target_fd);
-                    }
-                    else if(strncmp(redir_text, "&>", 2) == 0){
-                        //this is the case for &>, open file and then must dup2 
-                        //TWICE for both STDOUT AND STDERR!!!
-                        int fd = open(filename, flags, 0666);
-                        if (fd == -1){
-                            printf("open failed");
-                        }
-                        else{
-                            posix_spawn_file_actions_adddup2(&actions, fd, STDOUT_FILENO);
-                            posix_spawn_file_actions_adddup2(&actions, fd, STDERR_FILENO);
-                            fds[num_fds_open++] = fd;
-                        }
-
-                    }
-                    else if( target_fd != -1){
-                        int fd = open(filename, flags, 0666);
-                        if (fd == -1){
-                            printf("open failed");
-                        }
-                        else{
-                            posix_spawn_file_actions_adddup2(&actions, fd, target_fd);
-                            fds[num_fds_open++] = fd;
-                        }
-                    }
-
-                    //cleanup
-                    free(filename);
-                    free(redir_text);
+            //build argv for each command between | pipes
+            char **argv = build_argv(currNode);
+            int pipe[2];
+            if(i != numChild - 1){
+                int lastPipe = pipe2(pipe, O_CLOEXEC);
+                if(lastPipe == -1){
+                    perror("pipe2 failed");
+                    return;
                 }
             }
 
-            //create the job
-            struct job *thisJob = allocate_handler(FOREGROUND);
-            thisJob->num_processes_alive = 0;
+            //file actions for handling pipes stdin and stdout
+            posix_spawn_file_actions_t actions;
+            posix_spawn_file_actions_init(&actions) ;
 
+            if(stdin_fd != STDIN_FILENO){
+                posix_spawn_file_actions_adddup2(&actions, stdin_fd, STDIN_FILENO);
+            }
+            if (i != numChild-1){
+                posix_spawn_file_actions_adddup2(&actions, pipe[1], STDOUT_FILENO);
+            }
+
+            posix_spawnattr_t attrs;
+            posix_spawnattr_init(&attrs);
+
+            short flags = POSIX_SPAWN_SETPGROUP;
+            posix_spawnattr_setflags(&attrs, flags);
+
+            //first process should set the process group id to its own pid
+            posix_spawnattr_setpgroup(&attrs, thisJob->pgid);
+
+            //creat children
             int pid;
-            int result = posix_spawnp(&pid, argv[0], &actions, NULL, argv, environ);
+            // printf("command after pipe: %s\n", argv[0]);
 
-            if(result == 0){
+            int result = posix_spawnp(&pid, argv[0], &actions,&attrs,argv,environ);
+            //cleanup fds
+            posix_spawn_file_actions_destroy(&actions);
+            posix_spawnattr_destroy(&attrs);
+            
+
+            if(result == 0){//command after the pipe was successful
                 thisJob->num_processes_alive++;
-                thisJob->pid = pid;
-                wait_for_job(thisJob);
+                thisJob->pid = pid;//needed?
+                //first process should set the process group id to its own pid
+                if(i==0){
+                    thisJob->pgid = pid;
+                }
             }
             else{
-                printf("somethin failed");
-            }
-            for(int i = 0;i<num_fds_open;i++){
-                close(fds[i]);
+                printf("posix didnt work in pipe");
             }
 
-            delete_job(thisJob,true);
-            free_argv(argv,argc);
+            // printf("i: %d\n", i);
+            // printf("numchild: %d\n",numChild);
+            if(stdin_fd != STDIN_FILENO){
+                close(stdin_fd);
+            }
+            if (i != numChild -1){
+                close(pipe[1]);//close stdout of current pipe
+                stdin_fd = pipe[0];
+            }
+
+            //free args
+            int argc = ts_node_named_child_count(currNode);
+            free_argv(argv, argc);
+
         }
-        
-        else if(strcmp(type, "variable_assignment") == 0){
-            //its getting repetitive asf now....
-            //getting it from the index
-            TSNode varAssign_name = ts_node_named_child(child, 0);
-            TSNode varAssign_value= ts_node_named_child(child, 1);
+        wait_for_job(thisJob);
+        delete_job(thisJob, true);
 
-            //get the name and value from the TSNode
-            char *var_name = ts_extract_node_text(input, varAssign_name);
-            char *var_value = ts_extract_node_text(input, varAssign_value);
+    }// 
+    else if(strcmp(type, "redirected_statement") == 0){
+        //get the body of the node
+        TSNode bodyNode = ts_node_child_by_field_id(node, bodyId);
+        char **argv = build_argv(bodyNode);
+        int argc = ts_node_named_child_count(bodyNode);
 
-            //put in in the given hastable shell_vars
-            hash_put(&shell_vars, var_name, var_value);
+        //start actions like from piping
+        posix_spawn_file_actions_t actions;
+        posix_spawn_file_actions_init(&actions);
 
-            free(var_name);
-            free(var_value);
-            //notice no allocation of job here
-            //
+        //count how many redirects
+        int redirects = ts_node_named_child_count(node);
+        int fds[16];
+        int num_fds_open = 0;
+        for(int i = 0;i<redirects;i++){
+            //child in "ls > out.txt" is: "> out.txt"
+            TSNode redirect_child = ts_node_named_child(node, i);
+            const char *typeShi = ts_node_type(redirect_child);//why typeShi? bc type was taken
+
+            //need this loop for multiple file redirects in a single command: ls > yo.txt > wc
+            if(strcmp(typeShi, "file_redirect") == 0){
+                TSNode destination = ts_node_child_by_field_id(redirect_child, destinationId);
+                char *filename = ts_extract_node_text(input, destination);
+                char *redir_text = ts_extract_node_text(input, redirect_child);
+
+                //check if the redicret has a file descriptor
+                TSNode descriptor_node = ts_node_child_by_field_id(redirect_child,descriptorId);
+                bool has_descriptor = !ts_node_is_null(descriptor_node);
+
+                //hold the flags in a variable and then just go through
+                //the bottom if else block to fill it in based on
+                //why? bc it would look unreadable if u didnt 
+                // int fd;
+                int flags = 0;
+                int target_fd;
+                bool skip_open = false; //MUST have this for the fd to fd redirects >&N
+
+                //check if there is a file descriptor
+                int source_fd = STDOUT_FILENO;
+                if(has_descriptor){
+                    char *desc_str = ts_extract_node_text(input, descriptor_node);
+                    source_fd = atoi(desc_str);//convert int to string
+                    free(desc_str);
+                }
+
+                //check the flags and set the target_fd
+                if(strncmp(redir_text,"&>",2) == 0){
+                    //THIS REDIRECTS BOTH STDOUT AND STDERR
+                    flags = O_WRONLY | O_CREAT | O_CLOEXEC | O_TRUNC;
+                    target_fd = STDOUT_FILENO;
+                }
+                else if(strncmp(redir_text,">&",2) == 0  || strncmp(redir_text,"2>&",3) == 0){
+                    // >&N or 2>&N means fd to fd
+                    target_fd = source_fd;
+                    skip_open = true;
+                }
+                else if(strncmp(redir_text, ">", 1) == 0){
+                    flags = O_WRONLY | O_CREAT | O_CLOEXEC | O_TRUNC;
+                    target_fd = STDOUT_FILENO;
+                }
+                else if(strncmp(redir_text, "<", 1) == 0){
+                    flags = O_RDONLY | O_CLOEXEC;
+                    target_fd = STDIN_FILENO;
+                }
+
+                //do we have to open files?not if its fd to fd (>& or 2>&)
+                if(skip_open){
+                    int dest_fd = atoi(filename);
+                    posix_spawn_file_actions_adddup2(&actions,dest_fd,target_fd);
+                }
+                else if(strncmp(redir_text, "&>", 2) == 0){
+                    //this is the case for &>, open file and then must dup2 
+                    //TWICE for both STDOUT AND STDERR!!!
+                    int fd = open(filename, flags, 0666);
+                    if (fd == -1){
+                        printf("open failed");
+                    }
+                    else{
+                        posix_spawn_file_actions_adddup2(&actions, fd, STDOUT_FILENO);
+                        posix_spawn_file_actions_adddup2(&actions, fd, STDERR_FILENO);
+                        fds[num_fds_open++] = fd;
+                    }
+
+                }
+                else if( target_fd != -1){
+                    int fd = open(filename, flags, 0666);
+                    if (fd == -1){
+                        printf("open failed");
+                    }
+                    else{
+                        posix_spawn_file_actions_adddup2(&actions, fd, target_fd);
+                        fds[num_fds_open++] = fd;
+                    }
+                }
+
+                //cleanup
+                free(filename);
+                free(redir_text);
+            }
+        }
+
+        //create the job
+        struct job *thisJob = allocate_handler(FOREGROUND);
+        thisJob->num_processes_alive = 0;
+
+        int pid;
+        int result = posix_spawnp(&pid, argv[0], &actions, NULL, argv, environ);
+
+        if(result == 0){
+            thisJob->num_processes_alive++;
+            thisJob->pid = pid;
+            wait_for_job(thisJob);
         }
         else{
-            printf("node type `%s` not implemented\n", ts_node_type(child));
+            printf("somethin failed");
         }
+        for(int i = 0;i<num_fds_open;i++){
+            close(fds[i]);
+        }
+
+        delete_job(thisJob,true);
+        free_argv(argv,argc);
+    }
+    
+    else if(strcmp(type, "variable_assignment") == 0){
+        //its getting repetitive asf now....
+        //getting it from the index
+        TSNode varAssign_name = ts_node_named_child(node, 0);
+        TSNode varAssign_value= ts_node_named_child(node, 1);
+
+        //get the name and value from the TSNode
+        char *var_name = ts_extract_node_text(input, varAssign_name);
+        char *var_value = ts_extract_node_text(input, varAssign_value);
+
+        //put in in the given hastable shell_vars
+        hash_put(&shell_vars, var_name, var_value);
+
+        free(var_name);
+        free(var_value);
+        //notice no allocation of job here
+        //
+    }
+
+    else if (strcmp(type, "list") == 0) {
+        TSNode left  = ts_node_child_by_field_id(node, leftId);
+        TSNode right = ts_node_child_by_field_id(node, rightId);
+        TSNode op_node = ts_node_child_by_field_id(node, operatorId);
+        char *op = ts_extract_node_text(input, op_node);
+        run_statement(left);
+        if ((strcmp(op, "&&") == 0 && exit_status == 0) ||
+            (strcmp(op, "||") == 0 && exit_status != 0)) {
+            run_statement(right);
+        }
+        free(op);
+    }
+
+    else if (strcmp(type, "if_statement") == 0) {
+        TSNode cond = ts_node_child_by_field_id(node, conditionId);
+        TSNode body = ts_node_child_by_field_id(node, bodyId);
+        run_statement(cond);
+        bool taken = false;
+        if (exit_status == 0) {
+            run_program(body);
+            taken = true;
+        }
+        if (!taken) {
+            uint32_t n = ts_node_named_child_count(node);
+            for (uint32_t j = 0; j < n && !taken; j++) {
+                TSNode alt = ts_node_named_child(node, j);
+                const char *alt_type = ts_node_type(alt);
+                if (strcmp(alt_type, "elif_clause") == 0) {
+                    TSNode elif_cond = ts_node_child_by_field_id(alt, conditionId);
+                    TSNode elif_body = ts_node_child_by_field_id(alt, bodyId);
+                    run_statement(elif_cond);
+                    if (exit_status == 0) { run_program(elif_body); taken = true; }
+                } else if (strcmp(alt_type, "else_clause") == 0) {
+                    // else body is the first named child of else_clause
+                    TSNode else_body = ts_node_named_child(alt, 0);
+                    run_program(else_body);
+                    taken = true;
+                }
+            }
+        }
+    }
+    
+    // break statement should set a global flag that can be checked in the for loop
+    else if (strcmp(type, "break_statement") == 0) {
+    break_flag = true;
+    }
+    // for statement should check the global flag after each iteration and break if its set
+    else if (strcmp(type, "for_statement") == 0) {
+        TSNode var_node   = ts_node_child_by_field_id(node, variableId);
+        TSNode value_node = ts_node_child_by_field_id(node, valueId);
+        TSNode body_node  = ts_node_child_by_field_id(node, bodyId);
+        char *var_name = ts_extract_node_text(input, var_node);
+
+        uint32_t nvals = ts_node_named_child_count(value_node);
+        for (uint32_t j = 0; j < nvals && !break_flag; j++) {
+            TSNode word = ts_node_named_child(value_node, j);
+            char *word_text = ts_extract_node_text(input, word);
+            hash_put(&shell_vars, var_name, word_text);
+            free(word_text);
+            run_program(body_node);
+        }
+        break_flag = false;
+        free(var_name);
+    }
+
+    // while loop
+    else if (strcmp(type, "while_statement") == 0) {
+        TSNode cond_node = ts_node_child_by_field_id(node, conditionId);
+        TSNode body_node = ts_node_child_by_field_id(node, bodyId);
+        for (;;) {
+            run_statement(cond_node);
+            if (exit_status != 0 || break_flag) break;
+            run_program(body_node);
+            if (break_flag) { break_flag = false; break; }
+        }
+    }
+
+
+
+    else{
+        printf("node type `%s` not implemented\n", ts_node_type(node));
     }
 }
 
