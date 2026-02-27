@@ -424,7 +424,8 @@ static void if_statement_handler(TSNode ifNode)
                 continue;
             }
 
-            TSNode elifCondition = ts_node_child_by_field_id(statement, conditionId);
+            /* elif_clause has no named fields; condition is always named child 0 */
+            TSNode elifCondition = ts_node_named_child(statement, 0);
             if(execute_condition(elifCondition) == 0){
                 tookBranch = true;
                 int numElif = ts_node_named_child_count(statement);
@@ -542,24 +543,33 @@ expand_value(TSNode node)
 
     /* Double-quoted string: may contain string_content, expansions, cmd subs */
     if (strcmp(type, "string") == 0) {
+        /* tree-sitter-bash omits string_content for whitespace-only content,
+         * absorbing those bytes into the closing '"' node instead.
+         * When there are no named children the content between the quotes
+         * is the verbatim answer. */
+        if (ts_node_named_child_count(node) == 0) {
+            uint32_t s = ts_node_start_byte(node);
+            uint32_t e = ts_node_end_byte(node);
+            return e - s >= 2 ? strndup(input + s + 1, e - s - 2) : strdup("");
+        }
         char result[4096] = {0};
+        size_t pos = 0;
         int nc = ts_node_child_count(node);
         for (int j = 0; j < nc; j++) {
             TSNode cn = ts_node_child(node, j);
             const char *ct = ts_node_type(cn);
+            char *piece = NULL;
             if (strcmp(ct, "string_content") == 0) {
-                char *c = ts_extract_node_text(input, cn);
-                strncat(result, c, sizeof(result) - strlen(result) - 1);
-                free(c);
+                piece = ts_extract_node_text(input, cn);
             } else if (strcmp(ct, "simple_expansion") == 0 ||
-                       strcmp(ct, "expansion") == 0) {
-                char *sub = expand_value(cn);
-                strncat(result, sub, sizeof(result) - strlen(result) - 1);
-                free(sub);
-            } else if (strcmp(ct, "command_substitution") == 0) {
-                char *sub = expand_value(cn);
-                strncat(result, sub, sizeof(result) - strlen(result) - 1);
-                free(sub);
+                       strcmp(ct, "expansion") == 0 ||
+                       strcmp(ct, "command_substitution") == 0) {
+                piece = expand_value(cn);
+            }
+            if (piece) {
+                int n = snprintf(result + pos, sizeof(result) - pos, "%s", piece);
+                if (n > 0 && (size_t)n < sizeof(result) - pos) pos += n;
+                free(piece);
             }
         }
         return strdup(result);
@@ -580,10 +590,12 @@ expand_value(TSNode node)
     /* Concatenation: expand each part and join */
     if (strcmp(type, "concatenation") == 0) {
         char result[4096] = {0};
+        size_t pos = 0;
         int nc = ts_node_named_child_count(node);
         for (int i = 0; i < nc; i++) {
             char *part = expand_value(ts_node_named_child(node, i));
-            strncat(result, part, sizeof(result) - strlen(result) - 1);
+            int n = snprintf(result + pos, sizeof(result) - pos, "%s", part);
+            if (n > 0 && (size_t)n < sizeof(result) - pos) pos += n;
             free(part);
         }
         return strdup(result);
