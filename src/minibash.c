@@ -749,7 +749,7 @@ static void pipeline_helper(TSNode pipelineNode, char **redirect_filenames, char
         if(!ts_node_is_null(cmdRedir)){
             TSNode cmdDestin = ts_node_child_by_field_id(cmdRedir, destinationId);
             char *cmdRedirText = ts_extract_node_text(input, cmdRedir);
-            char *cmdFilename = ts_extract_node_text(input, cmdDestin);
+            char *cmdFilename = expand_value(cmdDestin);
             if(strncmp(cmdRedirText, "<", 1) == 0){
                 int fd = open(cmdFilename, O_RDONLY, 0);
                 if(fd >= 0){
@@ -822,163 +822,20 @@ static void pipeline_helper(TSNode pipelineNode, char **redirect_filenames, char
     delete_job(thisJob, true);
 
 }
-//gets ride of quotes
-static void strip_quotes_helper(TSNode arg_node,char **argv, int i)
-{
-    char *raw = ts_extract_node_text(input, arg_node);
-    int len = strlen(raw);
-    bool containsDouble = (raw[0] == '"' && raw[len-1] == '"');//starts and ends with double quotes
-    bool containsSingle = (raw[0] == '\'' && raw[len-1] == '\'');//stars and ends with single quotes
-    if(len >=2 && (containsSingle || containsDouble)){
-        argv[i] = strndup(raw+1,len-2);
-        free(raw);
-    }
-    else{
-        argv[i] = raw;
-    }
-}
-
-//handles the commands inside of a variable substition. ex: echo ${echo hello} world
-static char* command_sub_helper(const char  *cmd)
-{
-    //this uses popen(), which takes care of creating pipes
-    //forks and running the command
-    //it returns a pointer to a file FILE*
-    
-    //open pipes and run
-    FILE *fp = popen(cmd, "r");
-    if(fp==NULL){
-        return strdup("");
-    }
-
-    char buffer[4096] = {0};
-    if(fp != NULL){
-        fread(buffer, 1, sizeof(buffer)-1, fp);//read the buffer from
-        pclose(fp);
-    }
-
-    //get rid of new line
-    //this is like ex0
-    int bufferLen = strlen(buffer);
-    if(bufferLen > 0 && buffer[bufferLen-1] == '\n' ){
-        buffer[bufferLen-1] = '\0';
-    }
-    return strdup(buffer);
-}
-
-
 static char** build_argv(TSNode child)
 {
     int numChild = ts_node_named_child_count(child);
     int arg_index = 0;
-    char **argv = malloc(sizeof(char*) * (numChild+1));//+1 to NULL terminate
-                                                       
-    //build argv
-    for(int i = 0;i<numChild;i++){
-        TSNode arg_node = ts_node_named_child(child,i);
-        const char *type = ts_node_type(arg_node);
-        if(strcmp(type, "file_redirect") == 0){
-            //this is for the test 060 <.inputfile
-            //it shouldnt end up in argv
+    char **argv = malloc(sizeof(char*) * (numChild+1));
+
+    for(int i = 0; i < numChild; i++){
+        TSNode arg_node = ts_node_named_child(child, i);
+        if(strcmp(ts_node_type(arg_node), "file_redirect") == 0){
             continue;
         }
-
-        //this handles echo $? by expanding the variables $ and ?
-        if(strcmp(type, "simple_expansion") == 0 || strcmp(type, "expansion") == 0){
-            TSNode expansionChild = ts_node_named_child(arg_node, 0);
-            char *keyInHT = ts_extract_node_text(input, expansionChild);
-            /*
-             * variables can be in the system environment or the
-             * shell environemtn
-             * we gotta check if variables $ are in either
-             */
-
-            argv[arg_index++] = (char *)shell_variable_helper(keyInHT);
-            free(keyInHT);
-        }
-
-        //we can prolly call this this quotes handler 
-        //maybe make this a helper?
-        //bash extracts content without the quotes
-        else if(strcmp(type, "string") == 0){
-            //get whats inside the double quotes
-            char result[4096] = {0};//need an empty string to store the print result
-            bool hasContent = false;
-            int stringChildren = ts_node_child_count(arg_node);
-
-            for(int j = 0;j<stringChildren;j++){
-                TSNode child_node = ts_node_child(arg_node, j);
-                const char *type_child = ts_node_type(child_node);
-                if(strcmp(type_child, "string_content") == 0){
-                    char *content = ts_extract_node_text(input, child_node);
-                    snprintf(result + strlen(result), sizeof(result) - strlen(result), "%s", content);
-                    free(content);
-                    hasContent = true;
-                }
-                //because shell variables can also be in quotes
-                else if(strcmp(type_child, "simple_expansion") == 0 || strcmp(type_child, "expansion") == 0){
-                    TSNode expansionChild = ts_node_named_child(child_node, 0);
-                    char *keyInHT = ts_extract_node_text(input, expansionChild);
-                    char *expanded = (char*)shell_variable_helper(keyInHT);
-                    snprintf(result + strlen(result), sizeof(result) - strlen(result), "%s", expanded);
-                    /*
-                     * variables can be in the system environment or the
-                     * shell environemtn
-                     * we gotta check if variables $ are in either
-                     */
-
-                    free(keyInHT);
-                    free(expanded);
-                    hasContent = true;
-                }
-            }
-            if(!hasContent){
-                //empty strjng "" case
-                strip_quotes_helper(arg_node, argv, arg_index++);
-                //this logic is now in this helper^^
-                // char *raw = ts_extract_node_text(input, arg_node);
-                // int len = strlen(raw);
-                // if(len >=2 && raw[0] == '"' && raw[len-1] == '"'){
-                //     argv[i] = strndup(raw+1,len-2);
-                //     free(raw);
-                // }
-                // else{
-                //     argv[i] = raw;
-                // }
-            }else{
-                argv[arg_index++] = strdup(result);
-            }
-        }
-        // for some reason the tree sitter calls single quotes "raw strings"
-        else if(strcmp(type, "raw_string") == 0){
-            //strip the single quotes
-            strip_quotes_helper(arg_node, argv, arg_index++);
-            //this logic is now in this helper^^
-        }
-
-        else if(strcmp(type, "command_substitution") == 0){
-            //for test 080:
-            //$(echo dlroW | rev)
-            //need to extract echo dlroW | rev from $ ( )
-
-            char *rawText = ts_extract_node_text(input, arg_node);
-            int len = strlen(rawText);
-            //for a command sub with a pipe, its always gonna be:
-            //$(
-
-            char *inner = strndup(rawText+2,len-3);
-            free(rawText);
-
-            //same popen() method as in command sub helper
-            argv[arg_index++] = command_sub_helper(inner);
-            free(inner);
-        }
-        //regulr word, no quotes
-        else{
-            argv[arg_index++] = ts_extract_node_text(input, arg_node);
-        }
+        argv[arg_index++] = expand_value(arg_node);
     }
-    argv[arg_index] = NULL;//null terminate for posix_spawnp
+    argv[arg_index] = NULL;
     return argv;
 }
 
@@ -1243,7 +1100,7 @@ run_program(TSNode program)
                 //need this loop for multiple file redirects in a single command: ls > yo.txt > wc
                 if(strcmp(typeShi, "file_redirect") == 0){
                     TSNode destination = ts_node_child_by_field_id(redirect_child, destinationId);
-                    char *filename = ts_extract_node_text(input, destination);
+                    char *filename = expand_value(destination);
                     char *redir_text = ts_extract_node_text(input, redirect_child);
 
                     //store first redirect info for pipeline case
