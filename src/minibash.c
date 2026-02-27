@@ -47,7 +47,6 @@ static tommy_hashdyn shell_vars;        // a hash table containing the internal 
 static bool shouldexit = false;
 static int exit_status = 0;
 
-
 typedef enum {
     EXEC_NORMAL   = 0,
     EXEC_BREAK    = 1,
@@ -150,8 +149,8 @@ allocate_job(bool includeinjoblist)
     struct job * job = malloc(sizeof *job);
     job->num_processes_alive = 0;
     job->jid = -1;
-    job->pgid = 0;
     job->pid = -1;
+    job->pgid = 0;
     job->exit_status = 0;
     if (!includeinjoblist)
         return job;
@@ -343,18 +342,6 @@ handle_child_status(pid_t pid, int status)
 
 
     }
-
-    /* To be implemented. 
-     * Step 1. Given the pid, determine which job this pid is a part of
-     *         (how to do this is not part of the provided code.)
-     * Step 2. Determine what status change occurred using the
-     *         WIF*() macros.
-     * Step 3. Update the job status accordingly, and adjust 
-     *         num_processes_alive if appropriate.
-     *         If a process was stopped, save the terminal state.
-     */
-
-
 
 }
 
@@ -877,31 +864,6 @@ static char* command_sub_helper(const char  *cmd)
         buffer[bufferLen-1] = '\0';
     }
     return strdup(buffer);
-
-    // char cmd[4096] = {0};//the command itself
-    // for(int i = 0;argv[i]!=NULL;i++){
-    //     if(i>0){//must add space between the args
-    //         snprintf(cmd + strlen(cmd), sizeof(cmd) - strlen(cmd), "%s", " ");
-    //     }
-    //     snprintf(cmd + strlen(cmd), sizeof(cmd) - strlen(cmd), "%s", argv[i]);
-    // }
-    //
-    // FILE *fp = popen(cmd, "r");
-    // if(fp == NULL){
-    //     return strdup("");
-    // }
-    //
-    // //read output
-    // char buffer [4096] = {0};
-    // fread(buffer, 1, sizeof(buffer), fp);
-    //
-    // int len = strlen(buffer);
-    // if(len > 0 && buffer[len-1] == '\n'){
-    //     buffer[len-1] = '\0';
-    // }
-    //
-    // pclose(fp);
-    // return strdup(buffer);
 }
 
 
@@ -1063,16 +1025,17 @@ static void run_single_node(TSNode node)
             free_argv(argv, numChild);
             return;
         }
-        if (strcmp(argv[0], "break") == 0) {
-            exec_exception = EXEC_BREAK;
-            free_argv(argv, numChild);
-            return;
+        if (strcmp(argv[0], "break") == 0) { 
+            exec_exception = EXEC_BREAK; 
+            free_argv(argv, numChild); 
+            return; 
         }
-        if (strcmp(argv[0], "continue") == 0) {
-            exec_exception = EXEC_CONTINUE;
-            free_argv(argv, numChild);
-            return;
+        if (strcmp(argv[0], "continue") == 0) { 
+            exec_exception = EXEC_CONTINUE; 
+            free_argv(argv, numChild); 
+            return; 
         }
+
 
         struct job *thisJob = allocate_handler(FOREGROUND);
 
@@ -1218,18 +1181,18 @@ run_program(TSNode program)
                 free_argv(argv, numChild);
                 continue;//do not return here! we may not be at the end fo the for loop
             }
-            if(strcmp(argv[0], "break") == 0){
-                exec_exception = EXEC_BREAK;
-                free_argv(argv, numChild);
-                return;
+            if (strcmp(argv[0], "break") == 0) { 
+                exec_exception = EXEC_BREAK; 
+                free_argv(argv, numChild); 
+                return; 
             }
-            if(strcmp(argv[0], "continue") == 0){
-                exec_exception = EXEC_CONTINUE;
-                free_argv(argv, numChild);
-                return;
+            if (strcmp(argv[0], "continue") == 0) { 
+                exec_exception = EXEC_CONTINUE; 
+                free_argv(argv, numChild); 
+                return; 
             }
 
-            struct job *thisJob = allocate_handler(FOREGROUND);
+            struct job *thisJob = allocate_handler(FOREGROUND); 
 
             int pid;
             int result = posix_spawnp(&pid, argv[0], NULL, NULL, argv, environ);
@@ -1444,7 +1407,6 @@ run_program(TSNode program)
             if_statement_handler(child);
         }
    
-        /* ---- list: cmd1 && cmd2  /  cmd1 || cmd2  /  cmd1 ; cmd2 ---- */
         else if (strcmp(type, "list") == 0) {
             /* list has "fields": {} — no field IDs work.
             * Named children: 0=left, 1=right.
@@ -1485,17 +1447,14 @@ run_program(TSNode program)
             }
         }
             
-        /* ---- while loop ---- */
         else if (strcmp(type, "while_statement") == 0) {
             run_while_statement(child);
         }
 
-        /* ---- for loop ---- */
         else if (strcmp(type, "for_statement") == 0) {
             run_for_statement(child);
         }
 
-        /* ---- compound_statement or do_group: just run the body ---- */
         else if (strcmp(type, "do_group") == 0 || strcmp(type, "compound_statement") == 0) {
             run_body(child);
         }
