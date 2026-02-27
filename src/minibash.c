@@ -150,6 +150,9 @@ allocate_job(bool includeinjoblist)
     struct job * job = malloc(sizeof *job);
     job->num_processes_alive = 0;
     job->jid = -1;
+    job->pgid = 0;
+    job->pid = -1;
+    job->exit_status = 0;
     if (!includeinjoblist)
         return job;
 
@@ -1060,6 +1063,16 @@ static void run_single_node(TSNode node)
             free_argv(argv, numChild);
             return;
         }
+        if (strcmp(argv[0], "break") == 0) {
+            exec_exception = EXEC_BREAK;
+            free_argv(argv, numChild);
+            return;
+        }
+        if (strcmp(argv[0], "continue") == 0) {
+            exec_exception = EXEC_CONTINUE;
+            free_argv(argv, numChild);
+            return;
+        }
 
         struct job *thisJob = allocate_handler(FOREGROUND);
 
@@ -1205,8 +1218,18 @@ run_program(TSNode program)
                 free_argv(argv, numChild);
                 continue;//do not return here! we may not be at the end fo the for loop
             }
+            if(strcmp(argv[0], "break") == 0){
+                exec_exception = EXEC_BREAK;
+                free_argv(argv, numChild);
+                return;
+            }
+            if(strcmp(argv[0], "continue") == 0){
+                exec_exception = EXEC_CONTINUE;
+                free_argv(argv, numChild);
+                return;
+            }
 
-            struct job *thisJob = allocate_handler(FOREGROUND); 
+            struct job *thisJob = allocate_handler(FOREGROUND);
 
             int pid;
             int result = posix_spawnp(&pid, argv[0], NULL, NULL, argv, environ);
@@ -1396,6 +1419,10 @@ run_program(TSNode program)
 
                 delete_job(thisJob,true);
                 free_argv(argv,argc);
+                for(int i = 0;i<num_redirects;i++){
+                    free(redirect_filenames[i]);
+                    free(redirect_texts[i]);
+                }
             }
             posix_spawn_file_actions_destroy(&redirectActions);
         }
